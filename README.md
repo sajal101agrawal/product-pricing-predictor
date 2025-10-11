@@ -104,3 +104,105 @@ Participants are **STRICTLY NOT ALLOWED** to obtain prices from the internet, ex
 - Explore feature engineering techniques for text and image data
 - Consider ensemble methods combining different model types
 - Pay attention to outliers and data preprocessing
+
+---
+
+## Setup and Installation
+
+### Quick Start
+👉 **[QUICKSTART.md](QUICKSTART.md)** - Get started in 5 minutes
+
+### Platform-Specific Guides
+
+#### Ubuntu/Linux Setup
+👉 **[UBUNTU_SETUP.md](UBUNTU_SETUP.md)** - Complete installation instructions for Ubuntu systems
+
+**Quick setup:**
+```bash
+python3 -m venv env
+source env/bin/activate
+pip install -r requirements.txt
+python3 sample_code.py
+```
+
+#### Nvidia A100 GPU Setup
+👉 **[A100_GPU_SETUP.md](A100_GPU_SETUP.md)** - Optimized instructions for A100 GPU instances
+
+**Quick start:**
+```bash
+./run_on_a100.sh quick    # Quick test (5-10 minutes)
+./run_on_a100.sh full     # Full training (2-4 hours)
+```
+
+**Manual execution:**
+```bash
+python3 test.py \
+    --data_dir dataset \
+    --images_dir images \
+    --out_csv test_out.csv \
+    --folds 5 \
+    --max_train 75000 \
+    --max_test 75000
+```
+
+### Available Scripts
+
+| Script | Purpose | Usage |
+|--------|---------|-------|
+| `sample_code.py` | Basic dummy predictor | `python3 sample_code.py` |
+| `test.py` | Full multimodal training | `python3 test.py --help` |
+| `run_on_a100.sh` | Automated A100 runner | `./run_on_a100.sh [quick\|medium\|full]` |
+| `src/utils.py` | Image download utilities | `from src.utils import download_images` |
+
+### Common Commands
+
+```bash
+# Download sample images
+python3 -c "from src.utils import download_images; import pandas as pd; \
+df = pd.read_csv('dataset/sample_test.csv'); \
+download_images(df['image_link'], 'images')"
+
+# Verify GPU
+nvidia-smi
+python3 -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
+
+# Validate output format
+python3 -c "import pandas as pd; \
+df = pd.read_csv('test_out.csv'); \
+assert list(df.columns) == ['sample_id', 'price']; \
+print('✓ Format valid')"
+```
+
+---
+
+## Project Structure
+
+```
+product-pricing-predictor/
+├── dataset/
+│   ├── train.csv              # Training data (75k samples)
+│   ├── test.csv               # Test data (75k samples)  
+│   ├── sample_test.csv        # Sample test data
+│   └── sample_test_out.csv    # Sample output format
+├── src/
+│   ├── utils.py               # Helper functions
+│   └── example.ipynb          # Example notebook
+├── test.py                    # Main training script
+├── temp.py                    # Alternative training script
+├── sample_code.py             # Basic sample code
+├── run_on_a100.sh            # A100 automated runner
+├── requirements.txt           # Python dependencies
+├── Documentation_template.md  # Documentation template
+├── QUICKSTART.md             # Quick start guide
+├── UBUNTU_SETUP.md           # Ubuntu setup guide
+├── A100_GPU_SETUP.md         # A100 GPU guide
+└── README.md                 # This file
+```
+
+---
+
+## Need Help?
+
+- **Setup issues:** See [UBUNTU_SETUP.md](UBUNTU_SETUP.md#troubleshooting) or [A100_GPU_SETUP.md](A100_GPU_SETUP.md#troubleshooting)
+- **Quick start:** See [QUICKSTART.md](QUICKSTART.md)
+- **Format issues:** Compare your output with `dataset/sample_test_out.csv`
