@@ -19,8 +19,11 @@ Outputs:
 
 Author: MIT/Apache-2.0 compatible stack only.
 """
-import os, re, math, gc, random, warnings, json, argparse
+import os, re, math, gc, random, warnings, json, argparse, sys
 from pathlib import Path
+
+# Add src directory to path for utils import
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 warnings.filterwarnings("ignore")
 
@@ -313,12 +316,46 @@ def main():
     test_text_emb  = encode_text(test["catalog_content"].tolist(), 512)
 
     # Image embeddings (optional if images available)
+    # First, check if images need to be downloaded
     img_paths_train = infer_image_paths(train, images_dir)
     img_paths_test  = infer_image_paths(test, images_dir)
 
     n_found_train = sum(1 for p in img_paths_train if p and os.path.exists(p))
     n_found_test  = sum(1 for p in img_paths_test  if p and os.path.exists(p))
     found_ratio = (n_found_train + n_found_test) / max(1, len(img_paths_train) + len(img_paths_test))
+    
+    # If very few images are found and not explicitly disabled, try downloading
+    if found_ratio < 0.1 and not args.disable_images:
+        print(f"Only {found_ratio*100:.1f}% of images found. Attempting to download images...")
+        try:
+            from utils import download_images
+            
+            # Create images directory if it doesn't exist
+            images_dir.mkdir(exist_ok=True, parents=True)
+            
+            # Download train images
+            if len(train) > 0 and "image_link" in train.columns:
+                print(f"Downloading {len(train)} training images...")
+                train_links = train["image_link"].fillna("").tolist()
+                download_images(train_links, str(images_dir))
+            
+            # Download test images
+            if len(test) > 0 and "image_link" in test.columns:
+                print(f"Downloading {len(test)} test images...")
+                test_links = test["image_link"].fillna("").tolist()
+                download_images(test_links, str(images_dir))
+            
+            # Re-check after downloading
+            img_paths_train = infer_image_paths(train, images_dir)
+            img_paths_test  = infer_image_paths(test, images_dir)
+            n_found_train = sum(1 for p in img_paths_train if p and os.path.exists(p))
+            n_found_test  = sum(1 for p in img_paths_test  if p and os.path.exists(p))
+            found_ratio = (n_found_train + n_found_test) / max(1, len(img_paths_train) + len(img_paths_test))
+            print(f"After download: {found_ratio*100:.1f}% of images available ({n_found_train} train, {n_found_test} test)")
+        except Exception as e:
+            print(f"Warning: Could not download images: {e}")
+            print("Continuing without images...")
+    
     enable_images = (not args.disable_images) and (args.use_images or (found_ratio >= 0.2))  # auto-disable if too few
 
     if enable_images:
