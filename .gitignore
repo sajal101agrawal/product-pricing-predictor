@@ -2,3 +2,7 @@
 env
 images
 catboost_info
+catboost_info/
+*.log
+__pycache__
+test_out.csv
