@@ -195,6 +195,28 @@ def main():
         if artifacts["config"]["enable_images"]:
             print("Generating image embeddings...")
             img_te = infer_image_paths(test, images_dir)
+            n_found_te = sum(1 for p in img_te if p and os.path.exists(p))
+            found_ratio_te = n_found_te / max(1, len(img_te))
+            
+            # Try downloading if too few test images
+            if found_ratio_te < 0.1 and not args.disable_images:
+                print(f"Only {found_ratio_te*100:.1f}% of test images found. Attempting to download...")
+                try:
+                    from utils import download_images
+                    images_dir.mkdir(exist_ok=True, parents=True)
+                    
+                    if len(test) > 0 and "image_link" in test.columns:
+                        print(f"Downloading {len(test)} test images...")
+                        download_images(test["image_link"].fillna("").tolist(), str(images_dir))
+                    
+                    # Re-check
+                    img_te = infer_image_paths(test, images_dir)
+                    n_found_te = sum(1 for p in img_te if p and os.path.exists(p))
+                    found_ratio_te = n_found_te / max(1, len(img_te))
+                    print(f"After download: {found_ratio_te*100:.1f}% available")
+                except Exception as e:
+                    print(f"Warning: Could not download images: {e}")
+            
             vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
             
             def encode_images_chunked(paths, chunk_size=1280, batch_size=128):
@@ -304,12 +326,14 @@ def main():
     print("\nLoading data...")
     train = pd.read_csv(data_dir / "train.csv")
     
-    sample_test_path = data_dir / "sample_test.csv"
-    if sample_test_path.exists() and args.max_test:
-        print(f"Using sample_test.csv for faster iteration...")
-        test = pd.read_csv(sample_test_path)
-    else:
-        test = pd.read_csv(data_dir / "test.csv")
+    # sample_test_path = data_dir / "sample_test.csv"
+    # if sample_test_path.exists() and args.max_test:
+    #     print(f"Using sample_test.csv for faster iteration...")
+    #     test = pd.read_csv(sample_test_path)
+    # else:
+    #     test = pd.read_csv(data_dir / "test.csv")
+        
+    test = pd.read_csv(data_dir / "test.csv")
     
     print(f"Original train size: {len(train)}, test size: {len(test)}")
     
@@ -390,6 +414,30 @@ def main():
     img_te = infer_image_paths(test, images_dir)
     n_found = sum(1 for p in img_tr+img_te if p and os.path.exists(p))
     found_ratio = n_found / max(1, len(img_tr)+len(img_te))
+    
+    # Try downloading if too few images
+    if found_ratio < 0.1 and not args.disable_images:
+        print(f"Only {found_ratio*100:.1f}% of images found. Attempting to download...")
+        try:
+            from utils import download_images
+            images_dir.mkdir(exist_ok=True, parents=True)
+            
+            if len(train) > 0 and "image_link" in train.columns:
+                print(f"Downloading {len(train)} training images...")
+                download_images(train["image_link"].fillna("").tolist(), str(images_dir))
+            
+            if len(test) > 0 and "image_link" in test.columns:
+                print(f"Downloading {len(test)} test images...")
+                download_images(test["image_link"].fillna("").tolist(), str(images_dir))
+            
+            # Re-check
+            img_tr = infer_image_paths(train, images_dir)
+            img_te = infer_image_paths(test, images_dir)
+            n_found = sum(1 for p in img_tr+img_te if p and os.path.exists(p))
+            found_ratio = n_found / max(1, len(img_tr)+len(img_te))
+            print(f"After download: {found_ratio*100:.1f}% available")
+        except Exception as e:
+            print(f"Warning: Could not download images: {e}")
     
     enable_images = (not args.disable_images) and (args.use_images or found_ratio >= 0.2)
     
