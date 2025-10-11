@@ -49,6 +49,8 @@ def main():
                         help="Directory to save/load model (default: models/model_TIMESTAMP)")
     parser.add_argument("--use_existing_model", type=str, default=None,
                         help="Use existing model (skip training)")
+    parser.add_argument("--max_test", type=int, default=None,
+                        help="Max test samples to predict on (default: None = all samples)")
     
     args = parser.parse_args()
     
@@ -82,7 +84,11 @@ def main():
         print(f"  KNN neighbors: {args.knn_neighbors}")
         print(f"  Per-unit normalization: {args.per_unit}")
         print(f"  CPU only: {args.cpu_only}")
-    print(f"  Test samples: ALL (complete test.csv)")
+    
+    if args.max_test:
+        print(f"  Test samples: {args.max_test} (limited)")
+    else:
+        print(f"  Test samples: ALL (complete test.csv)")
     print(f"  Output: test_out.csv")
     print()
     print("=" * 80)
@@ -165,10 +171,13 @@ def main():
         print()
     
     # ============================================================
-    # STEP 2: Prediction on Full Test Dataset
+    # STEP 2: Prediction on Test Dataset
     # ============================================================
     print("\n" + "=" * 80)
-    print("STEP 2: PREDICTING ON FULL TEST DATASET")
+    if args.max_test:
+        print(f"STEP 2: PREDICTING ON {args.max_test} TEST SAMPLES")
+    else:
+        print("STEP 2: PREDICTING ON FULL TEST DATASET")
     print("=" * 80)
     print()
     
@@ -182,6 +191,9 @@ def main():
     
     if args.cpu_only:
         pred_cmd.append("--cpu_only")
+    
+    if args.max_test:
+        pred_cmd.extend(["--max_test", str(args.max_test)])
     
     print(f"Command: {' '.join(pred_cmd)}")
     print()

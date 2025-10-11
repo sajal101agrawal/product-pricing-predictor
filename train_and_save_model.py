@@ -226,8 +226,9 @@ def main():
         
         # Target encodings
         print("Applying target encodings...")
-        T_brand = artifacts["enc_brand"](test["brand"])
-        T_bxpk = artifacts["enc_bxpk"](test["brand"].astype(str) + "||" + test["pack"].astype(str))
+        global_mean = artifacts["config"]["global_mean"]
+        T_brand = test["brand"].map(artifacts["brand_mapping"]).fillna(global_mean).values.astype(float)
+        T_bxpk = (test["brand"].astype(str) + "||" + test["pack"].astype(str)).map(artifacts["bxpk_mapping"]).fillna(global_mean).values.astype(float)
         
         # Combined features
         T_emb = np.hstack([te_txt, te_img, T_tab, T_brand.reshape(-1,1), T_bxpk.reshape(-1,1)]).astype(np.float32)
@@ -442,6 +443,22 @@ def main():
     T_brand = enc_brand(test["brand"])
     T_bxpk = enc_bxpk(test["brand"].astype(str) + "||" + test["pack"].astype(str))
     
+    # Create picklable encoder mappings (instead of closure functions)
+    global_mean = float(np.mean(target))
+    alpha = 10.0
+    
+    # Brand encoder mapping
+    df_brand = pd.DataFrame({"k": brand_series.values, "y": target})
+    brand_stats = df_brand.groupby("k")["y"].mean()
+    brand_cnts = df_brand.groupby("k")["y"].size()
+    brand_mapping = ((brand_cnts * brand_stats + alpha * global_mean) / (brand_cnts + alpha)).to_dict()
+    
+    # Brand x Pack encoder mapping
+    df_bxpk = pd.DataFrame({"k": brand_pack_series.values, "y": target})
+    bxpk_stats = df_bxpk.groupby("k")["y"].mean()
+    bxpk_cnts = df_bxpk.groupby("k")["y"].size()
+    bxpk_mapping = ((bxpk_cnts * bxpk_stats + alpha * global_mean) / (bxpk_cnts + alpha)).to_dict()
+    
     # Combined features
     X_emb = np.hstack([tr_txt, tr_img, X_tab, oof_brand.reshape(-1,1), oof_bxpk.reshape(-1,1)]).astype(np.float32)
     T_emb = np.hstack([te_txt, te_img, T_tab, T_brand.reshape(-1,1), T_bxpk.reshape(-1,1)]).astype(np.float32)
@@ -545,8 +562,8 @@ def main():
             "tfidf": tfidf,
             "pca_text": pca_text,
             "pca_img": pca_img,
-            "enc_brand": enc_brand,
-            "enc_bxpk": enc_bxpk,
+            "brand_mapping": brand_mapping,  # Picklable dict instead of closure
+            "bxpk_mapping": bxpk_mapping,    # Picklable dict instead of closure
             "ridge_models": [ridge_model],
             "lgbm_tfidf_models": [lgbm_tfidf],
             "cat_models": [cat_model],
@@ -566,6 +583,7 @@ def main():
                 "knn_tau": args.knn_tau,
                 "enable_images": enable_images,
                 "text_model_name": text_model_name,
+                "global_mean": global_mean,
                 "global_median": gmed,
             }
         }
