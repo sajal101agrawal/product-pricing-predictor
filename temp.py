@@ -51,6 +51,11 @@ def build_argparser():
     ap.add_argument("--cpu_only", action="store_true", help="Do not use CUDA even if available")
     ap.add_argument("--max_train", type=int, default=5000, help="Max training samples to use")
     ap.add_argument("--max_test", type=int, default=100, help="Max test samples to use (for fast iteration)")
+    ap.add_argument("--text_batch_size", type=int, default=512, help="Batch size for text encoder")
+    ap.add_argument("--image_batch_size", type=int, default=64, help="Batch size for image encoder")
+    ap.add_argument("--tfidf_ngrams", default="1,2", help="TF-IDF ngram range as 'lo,hi', e.g., 1,3")
+    ap.add_argument("--meta_learner", default="ridge", choices=["ridge","lgbm"], help="Meta-learner for stacking")
+    ap.add_argument("--no_xgboost", action="store_true", help="Disable XGBoost base model")
     return ap
 
 # ------------------------
@@ -212,6 +217,7 @@ from sklearn.metrics import mean_absolute_error
 
 import lightgbm as lgb
 from catboost import CatBoostRegressor
+import xgboost as xgb
 
 def main():
     args = build_argparser().parse_args()
@@ -255,6 +261,26 @@ def main():
         df["len_words"] = df["catalog_content"].str.split().map(len).astype(int)
         df["has_digits"] = df["catalog_content"].str.contains(r'\d').astype(int)
 
+    # Enhanced textual/tabular features for stronger base learners
+    for df in (train, test):
+        # Price/discount indicators and categories
+        df["has_price_word"] = df["catalog_content"].str.contains(r"price|mrp|₹|\$|rs\.", case=False).astype(int)
+        df["has_discount"] = df["catalog_content"].str.contains(r"off|discount|save|deal|offer", case=False).astype(int)
+        df["is_food"] = df["catalog_content"].str.contains(r"oil|rice|flour|dal|masala|spice|food|grain", case=False).astype(int)
+        df["is_electronics"] = df["catalog_content"].str.contains(r"phone|mobile|laptop|cable|charger|electronic|adapter", case=False).astype(int)
+        df["is_beauty"] = df["catalog_content"].str.contains(r"cream|lotion|shampoo|soap|perfume|makeup|beauty", case=False).astype(int)
+        df["is_home"] = df["catalog_content"].str.contains(r"towel|sheet|blanket|pillow|curtain|mat|home", case=False).astype(int)
+
+        # Quantity/ratio features
+        df["unit_per_pack"] = df["unit_base"] / np.maximum(df["pack"], 1)
+        df["total_volume"] = df["unit_base"] * df["pack"]
+        df["is_bulk"] = (df["pack"] > 5).astype(int)
+
+        # Text composition stats
+        df["capital_ratio"] = df["catalog_content"].apply(lambda x: (sum(1 for c in x if c.isupper()) / max(1, len(x))) if isinstance(x, str) else 0.0)
+        df["digit_ratio"] = df["catalog_content"].apply(lambda x: (sum(1 for c in x if c.isdigit()) / max(1, len(x))) if isinstance(x, str) else 0.0)
+        df["has_brand_name"] = (df["brand"] != "__unknown__").astype(int)
+
     y = train["price"].astype(float)
     y_log = np.log1p(y)
     folds = args.folds
@@ -262,9 +288,14 @@ def main():
 
     # ---------------- TF-IDF + Ridge (text branch) ----------------
     print("TF-IDF + Ridge...")
-    print(f"Building TF-IDF with max_features={args.max_tfidf}...")
+    # Parse TF-IDF ngram range
+    try:
+        n_lo, n_hi = [int(s) for s in str(args.tfidf_ngrams).split(",")[:2]]
+    except Exception:
+        n_lo, n_hi = 1, 2
+    print(f"Building TF-IDF with max_features={args.max_tfidf}, ngram_range=({n_lo},{n_hi})...")
     tfidf = TfidfVectorizer(
-        ngram_range=(1,2),
+        ngram_range=(n_lo, n_hi),
         min_df=3,
         max_features=args.max_tfidf,
         strip_accents="unicode"
@@ -310,10 +341,10 @@ def main():
             embs.append(txt_encoder.encode(texts[i:i+batch_size], normalize_embeddings=True))
         return np.vstack(embs).astype(np.float32)
 
-    print(f"Encoding train text embeddings ({len(train)} samples)...", flush=True)
-    train_text_emb = encode_text(train["catalog_content"].tolist(), 512)
-    print(f"Encoding test text embeddings ({len(test)} samples)...", flush=True)
-    test_text_emb  = encode_text(test["catalog_content"].tolist(), 512)
+    print(f"Encoding train text embeddings ({len(train)} samples) with batch={args.text_batch_size}...", flush=True)
+    train_text_emb = encode_text(train["catalog_content"].tolist(), args.text_batch_size)
+    print(f"Encoding test text embeddings ({len(test)} samples) with batch={args.text_batch_size}...", flush=True)
+    test_text_emb  = encode_text(test["catalog_content"].tolist(), args.text_batch_size)
 
     # Image embeddings (optional if images available)
     # First, check if images need to be downloaded
@@ -361,16 +392,39 @@ def main():
     if enable_images:
         print(f"Images found for ~{found_ratio*100:.1f}% samples. Using image branch.")
         vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
-        def batch_open(paths):
-            ims = []
-            for p in paths:
-                if p and os.path.exists(p):
-                    ims.append(safe_image_open(p))
-                else:
-                    ims.append(None)
-            return ims
-        train_img_emb = vit.encode(batch_open(img_paths_train), batch=64).astype(np.float32)
-        test_img_emb  = vit.encode(batch_open(img_paths_test),  batch=64).astype(np.float32)
+        
+        def encode_images_batched(img_paths, batch_size=64, desc=""):
+            """Load and encode images in batches to avoid loading all into memory at once."""
+            all_embeddings = []
+            total = len(img_paths)
+            
+            for start_idx in range(0, total, batch_size):
+                if start_idx % (batch_size * 10) == 0:
+                    print(f"  {desc} Encoding images {start_idx}/{total}...", flush=True)
+                
+                end_idx = min(start_idx + batch_size, total)
+                batch_paths = img_paths[start_idx:end_idx]
+                
+                # Open only the current batch
+                batch_images = []
+                for p in batch_paths:
+                    if p and os.path.exists(p):
+                        batch_images.append(safe_image_open(p))
+                    else:
+                        batch_images.append(None)
+                
+                # Encode this batch
+                batch_emb = vit.encode(batch_images, batch=batch_size)
+                all_embeddings.append(batch_emb)
+                
+                # Clear memory
+                del batch_images
+                gc.collect()
+            
+            return np.vstack(all_embeddings) if all_embeddings else np.zeros((total, 384), dtype=np.float32)
+        
+        train_img_emb = encode_images_batched(img_paths_train, batch_size=args.image_batch_size, desc="Train").astype(np.float32)
+        test_img_emb  = encode_images_batched(img_paths_test,  batch_size=args.image_batch_size, desc="Test").astype(np.float32)
     else:
         print(f"Insufficient images (~{found_ratio*100:.1f}% found). Skipping image branch; using zeros.")
         # Fill zeros with fixed dim 384 (ViT-Small) to keep shapes consistent
@@ -387,8 +441,12 @@ def main():
         train_img_emb  = p_img.transform(train_img_emb)
         test_img_emb   = p_img.transform(test_img_emb)
 
-    # Tabular numerics
-    tab_cols = ["pack","unit_base","len_chars","len_words","has_digits"]
+    # Tabular numerics (enhanced)
+    tab_cols = [
+        "pack","unit_base","len_chars","len_words","has_digits",
+        "has_price_word","has_discount","is_food","is_electronics","is_beauty","is_home",
+        "unit_per_pack","total_volume","is_bulk","capital_ratio","digit_ratio","has_brand_name"
+    ]
     X_tab = train[tab_cols].values.astype(np.float32)
     T_tab = test[tab_cols].values.astype(np.float32)
 
@@ -403,7 +461,8 @@ def main():
         ytr, yva = y_log.iloc[tr_idx], y_log.iloc[va_idx]
 
         print(f"  Fold {f}/{folds} - Training CatBoost...", flush=True)
-        model = CatBoostRegressor(
+        # Use GPU for CatBoost if CUDA available and not disabled
+        cat_params = dict(
             iterations=2000,
             depth=6,
             learning_rate=0.035,
@@ -412,6 +471,9 @@ def main():
             random_seed=SEED,
             verbose=False
         )
+        if torch.cuda.is_available() and (not args.cpu_only):
+            cat_params.update(dict(task_type='GPU', devices='0'))
+        model = CatBoostRegressor(**cat_params)
         model.fit(trX, ytr, eval_set=(vaX, yva), use_best_model=True)
         cat_oof[va_idx] = model.predict(vaX)
         cat_test += model.predict(T_emb) / folds
@@ -419,6 +481,47 @@ def main():
         mae = mean_absolute_error(yva, cat_oof[va_idx])
         print(f"[Fold {f}] CatBoost MAE(log-space): {mae:.4f}")
         del trX, vaX; gc.collect()
+
+    # ---------------- XGBoost on embeddings -----------------
+    if not args.no_xgboost:
+        print("\nXGBoost on embeddings...")
+        xgb_oof = np.zeros(len(train))
+        xgb_test = np.zeros(len(test))
+
+        for f, (tr_idx, va_idx) in enumerate(skf.split(train, bins), 1):
+            trX, vaX = X_emb[tr_idx], X_emb[va_idx]
+            ytr, yva = y_log.iloc[tr_idx], y_log.iloc[va_idx]
+
+            print(f"  Fold {f}/{folds} - Training XGBoost...", flush=True)
+            xgb_params = dict(
+                n_estimators=2000,
+                max_depth=6,
+                learning_rate=0.03,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                objective='reg:absoluteerror',
+                eval_metric='mae',
+                random_state=SEED
+            )
+            if torch.cuda.is_available() and (not args.cpu_only):
+                xgb_params.update(dict(tree_method='gpu_hist'))
+            else:
+                xgb_params.update(dict(tree_method='hist'))
+
+            xgb_model = xgb.XGBRegressor(**xgb_params)
+            # Use callbacks-based early stopping for broad version compatibility
+            try:
+                from xgboost.callback import EarlyStopping as XgbEarlyStopping
+                callbacks = [XgbEarlyStopping(rounds=50, save_best=True)]
+            except Exception:
+                callbacks = []
+            xgb_model.fit(trX, ytr, eval_set=[(vaX, yva)], callbacks=callbacks)
+            xgb_oof[va_idx] = xgb_model.predict(vaX)
+            xgb_test += xgb_model.predict(T_emb) / folds
+
+            mae = mean_absolute_error(yva, xgb_oof[va_idx])
+            print(f"[Fold {f}] XGBoost MAE(log-space): {mae:.4f}")
+            del trX, vaX; gc.collect()
 
     # ---------------- Brand-Pack Anchor (LightGBM) -----------------
     print("Brand-Pack Anchor GBM...")
@@ -477,13 +580,28 @@ def main():
         del Xtr, Xva, Xte, tr, va, tst; gc.collect()
 
     # ---------------- Stacker -----------------
-    print("Stacking meta-learner (Ridge)...")
-    base_oof = np.vstack([ridge_oof, cat_oof, anchor_oof]).T
-    base_test = np.vstack([ridge_test, cat_test, anchor_test]).T
+    print("Stacking meta-learner...")
+    if not args.no_xgboost:
+        base_oof = np.vstack([ridge_oof, cat_oof, anchor_oof, xgb_oof]).T
+        base_test = np.vstack([ridge_test, cat_test, anchor_test, xgb_test]).T
+    else:
+        base_oof = np.vstack([ridge_oof, cat_oof, anchor_oof]).T
+        base_test = np.vstack([ridge_test, cat_test, anchor_test]).T
 
-    meta = Ridge(alpha=1.0, random_state=SEED)
-    meta.fit(base_oof, y_log.values)
-    pred_log_test = meta.predict(base_test)
+    if args.meta_learner == "ridge":
+        meta = Ridge(alpha=1.0, random_state=SEED)
+        meta.fit(base_oof, y_log.values)
+        pred_log_test = meta.predict(base_test)
+    else:
+        meta = lgb.LGBMRegressor(
+            n_estimators=500,
+            num_leaves=32,
+            learning_rate=0.05,
+            random_state=SEED,
+            verbose=-1
+        )
+        meta.fit(base_oof, y_log.values)
+        pred_log_test = meta.predict(base_test)
 
     # Final positivity constraint
     pred_price = np.expm1(pred_log_test)
