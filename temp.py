@@ -179,11 +179,14 @@ class ViTEncoder(torch.nn.Module):
         ])
 
     @torch.no_grad()
-    def encode(self, pil_list, batch=64):
+    def encode(self, pil_list, batch=128):
         # pil_list: list of PIL Images (already resized in safe_image_open or here)
         bufs, out = [], []
-        for im in pil_list:
+        none_indices = []
+        
+        for idx, im in enumerate(pil_list):
             if im is None:
+                none_indices.append(idx)
                 out.append(None)
             else:
                 bufs.append(self.tfm(im))
@@ -192,10 +195,18 @@ class ViTEncoder(torch.nn.Module):
                     feats = self.model(b).detach().cpu().numpy()
                     out.extend([f for f in feats])
                     bufs = []
+                    # Clear GPU cache periodically
+                    if torch.cuda.is_available() and len(out) % (batch * 10) == 0:
+                        torch.cuda.empty_cache()
+        
+        # Process remaining images
         if bufs:
             b = torch.stack(bufs).float().to(self.dev)
             feats = self.model(b).detach().cpu().numpy()
             out.extend([f for f in feats])
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
         # Normalize length with zeros where missing
         dim = len(out[0]) if (len(out)>0 and out[0] is not None) else 384
         Z = []
@@ -413,10 +424,26 @@ def main():
     if enable_images:
         print(f"Images used (~{found_ratio*100:.1f}% found)")
         vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
-        def open_batch(paths):
-            return [safe_image_open(p) for p in paths]
-        tr_img = vit.encode(open_batch(img_tr), 64).astype(np.float32)
-        te_img = vit.encode(open_batch(img_te), 64).astype(np.float32)
+        
+        # Process images in chunks to avoid loading all into memory at once
+        def encode_images_chunked(paths, chunk_size=1280, batch_size=128):
+            """Encode images in chunks with GPU batching"""
+            all_embeddings = []
+            for i in range(0, len(paths), chunk_size):
+                if i % (chunk_size * 5) == 0:
+                    print(f"  Encoding images {i}/{len(paths)}...")
+                chunk_paths = paths[i:i+chunk_size]
+                chunk_images = [safe_image_open(p) for p in chunk_paths]
+                chunk_emb = vit.encode(chunk_images, batch=batch_size)
+                all_embeddings.append(chunk_emb)
+                del chunk_images, chunk_emb
+                gc.collect()
+            return np.vstack(all_embeddings)
+        
+        print(f"Encoding {len(img_tr)} train images with GPU (batch=128)...")
+        tr_img = encode_images_chunked(img_tr, chunk_size=1280, batch_size=128).astype(np.float32)
+        print(f"Encoding {len(img_te)} test images with GPU (batch=128)...")
+        te_img = encode_images_chunked(img_te, chunk_size=1280, batch_size=128).astype(np.float32)
     else:
         print(f"Skip images (~{found_ratio*100:.1f}% found)")
         tr_img = np.zeros((len(train), 384), dtype=np.float32)
