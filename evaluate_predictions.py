@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import sys
+import argparse
 
 def calculate_smape(actual, predicted, eps=1e-8):
     """
@@ -168,9 +169,29 @@ def print_evaluation_report(metrics, actual, predicted, errors, sample_ids=None)
     print(f"\n{'='*80}\n")
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Evaluate price predictions using SMAPE metric",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "--predicted", "--input",
+        type=str,
+        default="test_out.csv",
+        help="Path to the file containing predicted prices (CSV with sample_id and price columns)"
+    )
+    parser.add_argument(
+        "--actual", "--ground-truth",
+        type=str,
+        default="dataset/sample_test_out.csv",
+        help="Path to the file containing actual/ground truth prices (CSV with sample_id column and either a 'price' column or uses the last column as price)"
+    )
+    
+    args = parser.parse_args()
+    
     # File paths
-    predicted_file = Path("test_out.csv")
-    actual_file = Path("dataset/sample_test_out.csv")
+    predicted_file = Path(args.predicted)
+    actual_file = Path(args.actual)
     
     # Check if files exist
     if not predicted_file.exists():
@@ -189,6 +210,30 @@ def main():
     
     predicted_df = pd.read_csv(predicted_file)
     actual_df = pd.read_csv(actual_file)
+    
+    # Handle price column in actual_df
+    if 'price' not in actual_df.columns:
+        # Use the last column as price if 'price' column doesn't exist
+        last_column = actual_df.columns[-1]
+        print(f"Note: 'price' column not found in actual file. Using last column '{last_column}' as price column.")
+        actual_df = actual_df.rename(columns={last_column: 'price'})
+    
+    # Check if predicted_df has price column
+    if 'price' not in predicted_df.columns:
+        print(f"Error: 'price' column not found in predicted file!")
+        print(f"Available columns: {', '.join(predicted_df.columns)}")
+        sys.exit(1)
+    
+    # Check if both dataframes have sample_id column
+    if 'sample_id' not in actual_df.columns:
+        print(f"Error: 'sample_id' column not found in actual file!")
+        print(f"Available columns: {', '.join(actual_df.columns)}")
+        sys.exit(1)
+    
+    if 'sample_id' not in predicted_df.columns:
+        print(f"Error: 'sample_id' column not found in predicted file!")
+        print(f"Available columns: {', '.join(predicted_df.columns)}")
+        sys.exit(1)
     
     # Merge on sample_id to ensure alignment
     merged = actual_df.merge(predicted_df, on='sample_id', suffixes=('_actual', '_predicted'))
