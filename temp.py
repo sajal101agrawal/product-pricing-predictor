@@ -94,7 +94,7 @@ UNIT_MAP = {"ml":1e-3, "l":1.0, "g":1e-3, "kg":1.0}  # normalize to L or kg
 UNIT_PATTERN = r'(\d+(?:\.\d+)?)\s*(ml|l|g|kg)\b'
 PACK_PATTERN = r'(?:pack\s*of\s*|x\s*|\u00D7\s*|\(\s*)(\d{1,3})(?:\s*(?:pcs|pieces|units)?\s*\))?'
 
-def parse_units(text: str) -> float:
+def parse_units(text: str) -> float: 
     if not isinstance(text, str): return 0.0
     total = 0.0
     for m in re.finditer(UNIT_PATTERN, text):
