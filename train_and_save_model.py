@@ -8,6 +8,8 @@ Features:
   - Automatic caching of text and image embeddings
   - Cache invalidation based on data hash
   - Significant speedup on subsequent runs
+  - Smart image downloading: if >5% images found, downloads missing ones
+  - Images enabled if ≥15% available (configurable with --use_images or --disable_images)
 
 Usage:
   # Train and save model (embeddings cached automatically)
@@ -15,6 +17,12 @@ Usage:
   
   # Load model and predict (uses cached embeddings if available)
   python train_and_save_model.py --load_model models/my_model --predict_only
+  
+  # Disable cache and force re-encoding
+  python train_and_save_model.py --no_cache --max_train 15000
+  
+  # Force use images even if <15% available
+  python train_and_save_model.py --use_images --max_train 15000
   
   # Specify custom cache directory
   python train_and_save_model.py --cache_dir my_cache --save_model models/my_model
@@ -61,6 +69,7 @@ def build_argparser():
     ap.add_argument("--data_dir", default="dataset", help="Path containing train.csv/test.csv")
     ap.add_argument("--images_dir", default="images", help="Path where images were downloaded")
     ap.add_argument("--cache_dir", default="cache", help="Directory for caching embeddings")
+    ap.add_argument("--no_cache", action="store_true", help="Disable cache (force re-encode)")
     ap.add_argument("--out_csv", default="test_out.csv", help="Submission file path")
     ap.add_argument("--folds", type=int, default=5, help="CV folds")
     ap.add_argument("--use_images", action="store_true", help="Force enable image branch")
@@ -133,11 +142,32 @@ def load_model_artifacts(load_dir):
     return artifacts
 
 def get_data_hash(df, columns=None):
-    """Generate a hash of the dataframe to detect changes"""
+    """Generate a stable hash of the dataframe to detect changes"""
     if columns is None:
         columns = df.columns.tolist()
-    # Hash based on shape and sample of data
-    hash_str = f"{df.shape}_{df[columns].iloc[::max(1, len(df)//1000)].values.tobytes()}"
+    
+    # Create a stable hash based on:
+    # 1. DataFrame shape
+    # 2. Sample IDs if available (most stable identifier)
+    # 3. Deterministic sample of data
+    hash_components = [str(df.shape), str(sorted(columns))]
+    
+    # Use sample_id for stable identification if available
+    if "sample_id" in df.columns:
+        # Sort by sample_id and take first/last 100 for stable hash
+        sorted_ids = sorted(df["sample_id"].tolist())
+        sample_ids = sorted_ids[:50] + sorted_ids[-50:]
+        hash_components.append(str(sample_ids))
+    else:
+        # Fall back to sampling first/last rows deterministically
+        sample_size = min(20, len(df))
+        if sample_size > 0:
+            # Use first and last rows (most stable)
+            first_sample = df[columns].head(sample_size).to_json(orient='records')
+            last_sample = df[columns].tail(sample_size).to_json(orient='records')
+            hash_components.extend([first_sample, last_sample])
+    
+    hash_str = "|".join(hash_components)
     return hashlib.md5(hash_str.encode()).hexdigest()[:16]
 
 def save_embeddings_cache(cache_dir, name, embeddings, data_hash, metadata=None):
@@ -165,8 +195,11 @@ def save_embeddings_cache(cache_dir, name, embeddings, data_hash, metadata=None)
     
     print(f"  ✓ Cached to {cache_file} ({cache_file.stat().st_size / 1024 / 1024:.1f} MB)")
 
-def load_embeddings_cache(cache_dir, name, data_hash, expected_shape=None):
+def load_embeddings_cache(cache_dir, name, data_hash, expected_shape=None, use_cache=True):
     """Load embeddings from cache if valid"""
+    if not use_cache:
+        return None
+    
     cache_path = Path(cache_dir)
     cache_file = cache_path / f"{name}_embeddings.npz"
     meta_file = cache_path / f"{name}_metadata.json"
@@ -174,25 +207,31 @@ def load_embeddings_cache(cache_dir, name, data_hash, expected_shape=None):
     if not cache_file.exists() or not meta_file.exists():
         return None
     
-    # Load metadata
-    with open(meta_file, "r") as f:
-        meta = json.load(f)
-    
-    # Validate cache
-    if meta.get("data_hash") != data_hash:
-        print(f"  ⚠ Cache invalid: data has changed")
+    try:
+        # Load metadata
+        with open(meta_file, "r") as f:
+            meta = json.load(f)
+        
+        # Validate cache
+        if meta.get("data_hash") != data_hash:
+            print(f"  ⚠ Cache invalid for {name}: data hash mismatch")
+            print(f"    Expected: {data_hash}, Got: {meta.get('data_hash')}")
+            return None
+        
+        if expected_shape and tuple(meta.get("shape", [])) != tuple(expected_shape):
+            print(f"  ⚠ Cache invalid for {name}: shape mismatch")
+            print(f"    Expected: {expected_shape}, Got: {meta.get('shape')}")
+            return None
+        
+        # Load embeddings
+        data = np.load(cache_file)
+        embeddings = data["embeddings"]
+        
+        print(f"  ✓ Loaded {name} from cache ({cache_file.stat().st_size / 1024 / 1024:.1f} MB)")
+        return embeddings
+    except Exception as e:
+        print(f"  ⚠ Cache load failed for {name}: {e}")
         return None
-    
-    if expected_shape and tuple(meta.get("shape", [])) != tuple(expected_shape):
-        print(f"  ⚠ Cache invalid: shape mismatch")
-        return None
-    
-    # Load embeddings
-    data = np.load(cache_file)
-    embeddings = data["embeddings"]
-    
-    print(f"  ✓ Loaded from cache: {cache_file} ({cache_file.stat().st_size / 1024 / 1024:.1f} MB)")
-    return embeddings
 
 def main():
     args = build_argparser().parse_args()
@@ -248,11 +287,16 @@ def main():
         print("Generating text embeddings...")
         test_text_hash = get_data_hash(test, ["catalog_content"])
         cache_dir = Path(args.cache_dir)
+        use_cache = not args.no_cache
         
-        te_txt = load_embeddings_cache(cache_dir, "test_text", test_text_hash, expected_shape=(len(test), 384))
+        te_txt = load_embeddings_cache(cache_dir, "test_text", test_text_hash, 
+                                      expected_shape=(len(test), 384), use_cache=use_cache)
         
         if te_txt is None:
-            print("  Cache miss - encoding text...")
+            if not use_cache:
+                print("  Cache disabled - encoding text...")
+            else:
+                print("  Cache miss - encoding text...")
             use_cuda = (not args.cpu_only)
             txt_encoder = SentenceTransformer(
                 artifacts["config"]["text_model_name"],
@@ -268,8 +312,9 @@ def main():
                 return np.vstack(embs).astype(np.float32)
             
             te_txt = encode_text(test["catalog_content"].tolist(), 512)
-            save_embeddings_cache(cache_dir, "test_text", te_txt, test_text_hash, 
-                                {"model": artifacts["config"]["text_model_name"]})
+            if use_cache:
+                save_embeddings_cache(cache_dir, "test_text", te_txt, test_text_hash, 
+                                    {"model": artifacts["config"]["text_model_name"]})
         
         # Image embeddings
         if artifacts["config"]["enable_images"]:
@@ -278,31 +323,38 @@ def main():
             n_found_te = sum(1 for p in img_te if p and os.path.exists(p))
             found_ratio_te = n_found_te / max(1, len(img_te))
             
-            # Try downloading if too few test images
-            if found_ratio_te < 0.1 and not args.disable_images:
-                print(f"Only {found_ratio_te*100:.1f}% of test images found. Attempting to download...")
+            # Try downloading missing test images if some are found
+            if found_ratio_te >= 0.0 and found_ratio_te < 0.95 and not args.disable_images:
+                print(f"Found {found_ratio_te*100:.1f}% of test images. Downloading missing images...")
                 try:
                     from utils import download_images
                     images_dir.mkdir(exist_ok=True, parents=True)
                     
                     if len(test) > 0 and "image_link" in test.columns:
-                        print(f"Downloading {len(test)} test images...")
-                        download_images(test["image_link"].fillna("").tolist(), str(images_dir))
+                        missing_test = [link for link, path in zip(test["image_link"].fillna(""), img_te)
+                                       if link and (not path or not os.path.exists(path))]
+                        if missing_test:
+                            print(f"  Downloading {len(missing_test)} missing test images...")
+                            download_images(missing_test, str(images_dir))
                     
-                    # Re-check
+                    # Re-check after download
                     img_te = infer_image_paths(test, images_dir)
                     n_found_te = sum(1 for p in img_te if p and os.path.exists(p))
                     found_ratio_te = n_found_te / max(1, len(img_te))
-                    print(f"After download: {found_ratio_te*100:.1f}% available")
+                    print(f"  After download: {found_ratio_te*100:.1f}% available")
                 except Exception as e:
-                    print(f"Warning: Could not download images: {e}")
+                    print(f"  Warning: Could not download images: {e}")
             
             # Check cache for image embeddings
-            test_image_hash = get_data_hash(test, ["sample_id"])  # Use sample_id as proxy for image paths
-            te_img = load_embeddings_cache(cache_dir, "test_image", test_image_hash, expected_shape=(len(test), 384))
+            test_image_hash = get_data_hash(test, ["sample_id"])
+            te_img = load_embeddings_cache(cache_dir, "test_image", test_image_hash, 
+                                          expected_shape=(len(test), 384), use_cache=use_cache)
             
             if te_img is None:
-                print("  Cache miss - encoding images...")
+                if not use_cache:
+                    print("  Cache disabled - encoding images...")
+                else:
+                    print("  Cache miss - encoding images...")
                 use_cuda = (not args.cpu_only)
                 vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
                 
@@ -320,7 +372,8 @@ def main():
                     return np.vstack(all_embeddings)
                 
                 te_img = encode_images_chunked(img_te, chunk_size=1280, batch_size=128).astype(np.float32)
-                save_embeddings_cache(cache_dir, "test_image", te_img, test_image_hash)
+                if use_cache:
+                    save_embeddings_cache(cache_dir, "test_image", te_img, test_image_hash)
         else:
             te_img = np.zeros((len(test), 384), dtype=np.float32)
         
@@ -405,6 +458,11 @@ def main():
     print("="*80)
     print("TRAINING MODE")
     print("="*80)
+    if not args.no_cache:
+        print(f"Caching enabled: {args.cache_dir}/")
+        print("  (embeddings will be saved and reused on subsequent runs)")
+    else:
+        print("Caching disabled: embeddings will be re-encoded")
     
     # This is the full training code from temp.py
     # For brevity, I'll import and run temp.py's main logic,
@@ -482,13 +540,16 @@ def main():
     text_model_name = "BAAI/bge-small-en-v1.5"
     use_cuda = (not args.cpu_only)
     cache_dir = Path(args.cache_dir)
+    use_cache = not args.no_cache
     
     # Cache text embeddings
     train_text_hash = get_data_hash(train, ["catalog_content"])
     test_text_hash = get_data_hash(test, ["catalog_content"])
     
-    tr_txt = load_embeddings_cache(cache_dir, "train_text", train_text_hash, expected_shape=(len(train), 384))
-    te_txt = load_embeddings_cache(cache_dir, "test_text", test_text_hash, expected_shape=(len(test), 384))
+    tr_txt = load_embeddings_cache(cache_dir, "train_text", train_text_hash, 
+                                   expected_shape=(len(train), 384), use_cache=use_cache)
+    te_txt = load_embeddings_cache(cache_dir, "test_text", test_text_hash, 
+                                   expected_shape=(len(test), 384), use_cache=use_cache)
     
     if tr_txt is None or te_txt is None:
         print(f"Loading text encoder: {text_model_name} (cuda={use_cuda})...")
@@ -505,12 +566,14 @@ def main():
         if tr_txt is None:
             print(f"Encoding train text ({len(train)} samples)...")
             tr_txt = encode_text(train["catalog_content"].tolist(), 512)
-            save_embeddings_cache(cache_dir, "train_text", tr_txt, train_text_hash, {"model": text_model_name})
+            if use_cache:
+                save_embeddings_cache(cache_dir, "train_text", tr_txt, train_text_hash, {"model": text_model_name})
         
         if te_txt is None:
             print(f"Encoding test text ({len(test)} samples)...")
             te_txt = encode_text(test["catalog_content"].tolist(), 512)
-            save_embeddings_cache(cache_dir, "test_text", te_txt, test_text_hash, {"model": text_model_name})
+            if use_cache:
+                save_embeddings_cache(cache_dir, "test_text", te_txt, test_text_hash, {"model": text_model_name})
     
     # Images
     img_tr = infer_image_paths(train, images_dir)
@@ -518,31 +581,40 @@ def main():
     n_found = sum(1 for p in img_tr+img_te if p and os.path.exists(p))
     found_ratio = n_found / max(1, len(img_tr)+len(img_te))
     
-    # Try downloading if too few images
-    if found_ratio < 0.1 and not args.disable_images:
-        print(f"Only {found_ratio*100:.1f}% of images found. Attempting to download...")
+    # Try downloading missing images if some are found but not all
+    # Strategy: if >5% found, download the rest to complete the set
+    if found_ratio >= 0.05 and found_ratio < 0.95 and not args.disable_images:
+        print(f"Found {found_ratio*100:.1f}% of images. Downloading missing images...")
         try:
             from utils import download_images
             images_dir.mkdir(exist_ok=True, parents=True)
             
+            # Download only missing images
             if len(train) > 0 and "image_link" in train.columns:
-                print(f"Downloading {len(train)} training images...")
-                download_images(train["image_link"].fillna("").tolist(), str(images_dir))
+                missing_train = [link for link, path in zip(train["image_link"].fillna(""), img_tr) 
+                                if link and (not path or not os.path.exists(path))]
+                if missing_train:
+                    print(f"  Downloading {len(missing_train)} missing training images...")
+                    download_images(missing_train, str(images_dir))
             
             if len(test) > 0 and "image_link" in test.columns:
-                print(f"Downloading {len(test)} test images...")
-                download_images(test["image_link"].fillna("").tolist(), str(images_dir))
+                missing_test = [link for link, path in zip(test["image_link"].fillna(""), img_te)
+                               if link and (not path or not os.path.exists(path))]
+                if missing_test:
+                    print(f"  Downloading {len(missing_test)} missing test images...")
+                    download_images(missing_test, str(images_dir))
             
-            # Re-check
+            # Re-check after download
             img_tr = infer_image_paths(train, images_dir)
             img_te = infer_image_paths(test, images_dir)
             n_found = sum(1 for p in img_tr+img_te if p and os.path.exists(p))
             found_ratio = n_found / max(1, len(img_tr)+len(img_te))
-            print(f"After download: {found_ratio*100:.1f}% available")
+            print(f"  After download: {found_ratio*100:.1f}% available")
         except Exception as e:
-            print(f"Warning: Could not download images: {e}")
+            print(f"  Warning: Could not download images: {e}")
     
-    enable_images = (not args.disable_images) and (args.use_images or found_ratio >= 0.2)
+    # Enable images if we have a reasonable amount (>15%) or user forces it
+    enable_images = (not args.disable_images) and (args.use_images or found_ratio >= 0.15)
     
     if enable_images:
         print(f"Images used (~{found_ratio*100:.1f}% found)")
@@ -551,8 +623,10 @@ def main():
         train_image_hash = get_data_hash(train, ["sample_id"])
         test_image_hash = get_data_hash(test, ["sample_id"])
         
-        tr_img = load_embeddings_cache(cache_dir, "train_image", train_image_hash, expected_shape=(len(train), 384))
-        te_img = load_embeddings_cache(cache_dir, "test_image", test_image_hash, expected_shape=(len(test), 384))
+        tr_img = load_embeddings_cache(cache_dir, "train_image", train_image_hash, 
+                                      expected_shape=(len(train), 384), use_cache=use_cache)
+        te_img = load_embeddings_cache(cache_dir, "test_image", test_image_hash, 
+                                      expected_shape=(len(test), 384), use_cache=use_cache)
         
         if tr_img is None or te_img is None:
             vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
@@ -573,12 +647,14 @@ def main():
             if tr_img is None:
                 print(f"Encoding {len(img_tr)} train images...")
                 tr_img = encode_images_chunked(img_tr, chunk_size=1280, batch_size=128).astype(np.float32)
-                save_embeddings_cache(cache_dir, "train_image", tr_img, train_image_hash)
+                if use_cache:
+                    save_embeddings_cache(cache_dir, "train_image", tr_img, train_image_hash)
             
             if te_img is None:
                 print(f"Encoding {len(img_te)} test images...")
                 te_img = encode_images_chunked(img_te, chunk_size=1280, batch_size=128).astype(np.float32)
-                save_embeddings_cache(cache_dir, "test_image", te_img, test_image_hash)
+                if use_cache:
+                    save_embeddings_cache(cache_dir, "test_image", te_img, test_image_hash)
     else:
         print(f"Skip images (~{found_ratio*100:.1f}% found)")
         tr_img = np.zeros((len(train), 384), dtype=np.float32)
