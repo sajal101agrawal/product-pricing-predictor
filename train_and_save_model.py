@@ -2,16 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 Smart Product Pricing — Train and Save Model
-Extended version of temp.py with model saving/loading capabilities
+Extended version of temp.py with model saving/loading capabilities and embeddings caching
+
+Features:
+  - Automatic caching of text and image embeddings
+  - Cache invalidation based on data hash
+  - Significant speedup on subsequent runs
 
 Usage:
-  # Train and save model
+  # Train and save model (embeddings cached automatically)
   python train_and_save_model.py --max_train 15000 --save_model models/my_model
   
-  # Load model and predict
+  # Load model and predict (uses cached embeddings if available)
   python train_and_save_model.py --load_model models/my_model --predict_only
+  
+  # Specify custom cache directory
+  python train_and_save_model.py --cache_dir my_cache --save_model models/my_model
 """
-import os, re, math, gc, random, warnings, json, argparse, sys, pickle
+import os, re, math, gc, random, warnings, json, argparse, sys, pickle, hashlib
 from pathlib import Path
 
 # Add src directory to path for utils import
@@ -52,6 +60,7 @@ def build_argparser():
     ap = argparse.ArgumentParser(description="Smart Product Pricing with Model Save/Load")
     ap.add_argument("--data_dir", default="dataset", help="Path containing train.csv/test.csv")
     ap.add_argument("--images_dir", default="images", help="Path where images were downloaded")
+    ap.add_argument("--cache_dir", default="cache", help="Directory for caching embeddings")
     ap.add_argument("--out_csv", default="test_out.csv", help="Submission file path")
     ap.add_argument("--folds", type=int, default=5, help="CV folds")
     ap.add_argument("--use_images", action="store_true", help="Force enable image branch")
@@ -123,6 +132,68 @@ def load_model_artifacts(load_dir):
     
     return artifacts
 
+def get_data_hash(df, columns=None):
+    """Generate a hash of the dataframe to detect changes"""
+    if columns is None:
+        columns = df.columns.tolist()
+    # Hash based on shape and sample of data
+    hash_str = f"{df.shape}_{df[columns].iloc[::max(1, len(df)//1000)].values.tobytes()}"
+    return hashlib.md5(hash_str.encode()).hexdigest()[:16]
+
+def save_embeddings_cache(cache_dir, name, embeddings, data_hash, metadata=None):
+    """Save embeddings to cache with metadata"""
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    
+    cache_file = cache_path / f"{name}_embeddings.npz"
+    meta_file = cache_path / f"{name}_metadata.json"
+    
+    # Save embeddings
+    np.savez_compressed(cache_file, embeddings=embeddings)
+    
+    # Save metadata
+    meta = {
+        "data_hash": data_hash,
+        "shape": embeddings.shape,
+        "dtype": str(embeddings.dtype),
+    }
+    if metadata:
+        meta.update(metadata)
+    
+    with open(meta_file, "w") as f:
+        json.dump(meta, f, indent=2)
+    
+    print(f"  ✓ Cached to {cache_file} ({cache_file.stat().st_size / 1024 / 1024:.1f} MB)")
+
+def load_embeddings_cache(cache_dir, name, data_hash, expected_shape=None):
+    """Load embeddings from cache if valid"""
+    cache_path = Path(cache_dir)
+    cache_file = cache_path / f"{name}_embeddings.npz"
+    meta_file = cache_path / f"{name}_metadata.json"
+    
+    if not cache_file.exists() or not meta_file.exists():
+        return None
+    
+    # Load metadata
+    with open(meta_file, "r") as f:
+        meta = json.load(f)
+    
+    # Validate cache
+    if meta.get("data_hash") != data_hash:
+        print(f"  ⚠ Cache invalid: data has changed")
+        return None
+    
+    if expected_shape and tuple(meta.get("shape", [])) != tuple(expected_shape):
+        print(f"  ⚠ Cache invalid: shape mismatch")
+        return None
+    
+    # Load embeddings
+    data = np.load(cache_file)
+    embeddings = data["embeddings"]
+    
+    print(f"  ✓ Loaded from cache: {cache_file} ({cache_file.stat().st_size / 1024 / 1024:.1f} MB)")
+    return embeddings
+
 def main():
     args = build_argparser().parse_args()
     
@@ -175,21 +246,30 @@ def main():
         
         # Text embeddings
         print("Generating text embeddings...")
-        use_cuda = (not args.cpu_only)
-        txt_encoder = SentenceTransformer(
-            artifacts["config"]["text_model_name"],
-            device=str(device(allow_cuda=use_cuda))
-        )
+        test_text_hash = get_data_hash(test, ["catalog_content"])
+        cache_dir = Path(args.cache_dir)
         
-        def encode_text(texts, batch_size=512):
-            embs = []
-            for i in range(0, len(texts), batch_size):
-                if i % 2048 == 0:
-                    print(f"  Encoding batch {i}/{len(texts)}...")
-                embs.append(txt_encoder.encode(texts[i:i+batch_size], normalize_embeddings=True))
-            return np.vstack(embs).astype(np.float32)
+        te_txt = load_embeddings_cache(cache_dir, "test_text", test_text_hash, expected_shape=(len(test), 384))
         
-        te_txt = encode_text(test["catalog_content"].tolist(), 512)
+        if te_txt is None:
+            print("  Cache miss - encoding text...")
+            use_cuda = (not args.cpu_only)
+            txt_encoder = SentenceTransformer(
+                artifacts["config"]["text_model_name"],
+                device=str(device(allow_cuda=use_cuda))
+            )
+            
+            def encode_text(texts, batch_size=512):
+                embs = []
+                for i in range(0, len(texts), batch_size):
+                    if i % 2048 == 0:
+                        print(f"  Encoding batch {i}/{len(texts)}...")
+                    embs.append(txt_encoder.encode(texts[i:i+batch_size], normalize_embeddings=True))
+                return np.vstack(embs).astype(np.float32)
+            
+            te_txt = encode_text(test["catalog_content"].tolist(), 512)
+            save_embeddings_cache(cache_dir, "test_text", te_txt, test_text_hash, 
+                                {"model": artifacts["config"]["text_model_name"]})
         
         # Image embeddings
         if artifacts["config"]["enable_images"]:
@@ -217,22 +297,30 @@ def main():
                 except Exception as e:
                     print(f"Warning: Could not download images: {e}")
             
-            vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
+            # Check cache for image embeddings
+            test_image_hash = get_data_hash(test, ["sample_id"])  # Use sample_id as proxy for image paths
+            te_img = load_embeddings_cache(cache_dir, "test_image", test_image_hash, expected_shape=(len(test), 384))
             
-            def encode_images_chunked(paths, chunk_size=1280, batch_size=128):
-                all_embeddings = []
-                for i in range(0, len(paths), chunk_size):
-                    if i % (chunk_size * 5) == 0:
-                        print(f"  Encoding images {i}/{len(paths)}...")
-                    chunk_paths = paths[i:i+chunk_size]
-                    chunk_images = [safe_image_open(p) for p in chunk_paths]
-                    chunk_emb = vit.encode(chunk_images, batch=batch_size)
-                    all_embeddings.append(chunk_emb)
-                    del chunk_images, chunk_emb
-                    gc.collect()
-                return np.vstack(all_embeddings)
-            
-            te_img = encode_images_chunked(img_te, chunk_size=1280, batch_size=128).astype(np.float32)
+            if te_img is None:
+                print("  Cache miss - encoding images...")
+                use_cuda = (not args.cpu_only)
+                vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
+                
+                def encode_images_chunked(paths, chunk_size=1280, batch_size=128):
+                    all_embeddings = []
+                    for i in range(0, len(paths), chunk_size):
+                        if i % (chunk_size * 5) == 0:
+                            print(f"  Encoding images {i}/{len(paths)}...")
+                        chunk_paths = paths[i:i+chunk_size]
+                        chunk_images = [safe_image_open(p) for p in chunk_paths]
+                        chunk_emb = vit.encode(chunk_images, batch=batch_size)
+                        all_embeddings.append(chunk_emb)
+                        del chunk_images, chunk_emb
+                        gc.collect()
+                    return np.vstack(all_embeddings)
+                
+                te_img = encode_images_chunked(img_te, chunk_size=1280, batch_size=128).astype(np.float32)
+                save_embeddings_cache(cache_dir, "test_image", te_img, test_image_hash)
         else:
             te_img = np.zeros((len(test), 384), dtype=np.float32)
         
@@ -393,21 +481,36 @@ def main():
     print("\nGenerating embeddings...")
     text_model_name = "BAAI/bge-small-en-v1.5"
     use_cuda = (not args.cpu_only)
-    print(f"Loading text encoder: {text_model_name} (cuda={use_cuda})...")
-    txt_encoder = SentenceTransformer(text_model_name, device=str(device(allow_cuda=use_cuda)))
+    cache_dir = Path(args.cache_dir)
     
-    def encode_text(texts, batch_size=512):
-        embs = []
-        for i in range(0, len(texts), batch_size):
-            if i % 2048 == 0:
-                print(f"  Encoding batch {i}/{len(texts)}...")
-            embs.append(txt_encoder.encode(texts[i:i+batch_size], normalize_embeddings=True))
-        return np.vstack(embs).astype(np.float32)
+    # Cache text embeddings
+    train_text_hash = get_data_hash(train, ["catalog_content"])
+    test_text_hash = get_data_hash(test, ["catalog_content"])
     
-    print(f"Encoding train text ({len(train)} samples)...")
-    tr_txt = encode_text(train["catalog_content"].tolist(), 512)
-    print(f"Encoding test text ({len(test)} samples)...")
-    te_txt = encode_text(test["catalog_content"].tolist(), 512)
+    tr_txt = load_embeddings_cache(cache_dir, "train_text", train_text_hash, expected_shape=(len(train), 384))
+    te_txt = load_embeddings_cache(cache_dir, "test_text", test_text_hash, expected_shape=(len(test), 384))
+    
+    if tr_txt is None or te_txt is None:
+        print(f"Loading text encoder: {text_model_name} (cuda={use_cuda})...")
+        txt_encoder = SentenceTransformer(text_model_name, device=str(device(allow_cuda=use_cuda)))
+        
+        def encode_text(texts, batch_size=512):
+            embs = []
+            for i in range(0, len(texts), batch_size):
+                if i % 2048 == 0:
+                    print(f"  Encoding batch {i}/{len(texts)}...")
+                embs.append(txt_encoder.encode(texts[i:i+batch_size], normalize_embeddings=True))
+            return np.vstack(embs).astype(np.float32)
+        
+        if tr_txt is None:
+            print(f"Encoding train text ({len(train)} samples)...")
+            tr_txt = encode_text(train["catalog_content"].tolist(), 512)
+            save_embeddings_cache(cache_dir, "train_text", tr_txt, train_text_hash, {"model": text_model_name})
+        
+        if te_txt is None:
+            print(f"Encoding test text ({len(test)} samples)...")
+            te_txt = encode_text(test["catalog_content"].tolist(), 512)
+            save_embeddings_cache(cache_dir, "test_text", te_txt, test_text_hash, {"model": text_model_name})
     
     # Images
     img_tr = infer_image_paths(train, images_dir)
@@ -443,25 +546,39 @@ def main():
     
     if enable_images:
         print(f"Images used (~{found_ratio*100:.1f}% found)")
-        vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
         
-        def encode_images_chunked(paths, chunk_size=1280, batch_size=128):
-            all_embeddings = []
-            for i in range(0, len(paths), chunk_size):
-                if i % (chunk_size * 5) == 0:
-                    print(f"  Encoding images {i}/{len(paths)}...")
-                chunk_paths = paths[i:i+chunk_size]
-                chunk_images = [safe_image_open(p) for p in chunk_paths]
-                chunk_emb = vit.encode(chunk_images, batch=batch_size)
-                all_embeddings.append(chunk_emb)
-                del chunk_images, chunk_emb
-                gc.collect()
-            return np.vstack(all_embeddings)
+        # Cache image embeddings
+        train_image_hash = get_data_hash(train, ["sample_id"])
+        test_image_hash = get_data_hash(test, ["sample_id"])
         
-        print(f"Encoding {len(img_tr)} train images...")
-        tr_img = encode_images_chunked(img_tr, chunk_size=1280, batch_size=128).astype(np.float32)
-        print(f"Encoding {len(img_te)} test images...")
-        te_img = encode_images_chunked(img_te, chunk_size=1280, batch_size=128).astype(np.float32)
+        tr_img = load_embeddings_cache(cache_dir, "train_image", train_image_hash, expected_shape=(len(train), 384))
+        te_img = load_embeddings_cache(cache_dir, "test_image", test_image_hash, expected_shape=(len(test), 384))
+        
+        if tr_img is None or te_img is None:
+            vit = ViTEncoder("vit_small_patch16_224", use_cuda=use_cuda)
+            
+            def encode_images_chunked(paths, chunk_size=1280, batch_size=128):
+                all_embeddings = []
+                for i in range(0, len(paths), chunk_size):
+                    if i % (chunk_size * 5) == 0:
+                        print(f"  Encoding images {i}/{len(paths)}...")
+                    chunk_paths = paths[i:i+chunk_size]
+                    chunk_images = [safe_image_open(p) for p in chunk_paths]
+                    chunk_emb = vit.encode(chunk_images, batch=batch_size)
+                    all_embeddings.append(chunk_emb)
+                    del chunk_images, chunk_emb
+                    gc.collect()
+                return np.vstack(all_embeddings)
+            
+            if tr_img is None:
+                print(f"Encoding {len(img_tr)} train images...")
+                tr_img = encode_images_chunked(img_tr, chunk_size=1280, batch_size=128).astype(np.float32)
+                save_embeddings_cache(cache_dir, "train_image", tr_img, train_image_hash)
+            
+            if te_img is None:
+                print(f"Encoding {len(img_te)} test images...")
+                te_img = encode_images_chunked(img_te, chunk_size=1280, batch_size=128).astype(np.float32)
+                save_embeddings_cache(cache_dir, "test_image", te_img, test_image_hash)
     else:
         print(f"Skip images (~{found_ratio*100:.1f}% found)")
         tr_img = np.zeros((len(train), 384), dtype=np.float32)
