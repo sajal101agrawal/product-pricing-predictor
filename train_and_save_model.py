@@ -72,6 +72,7 @@ from catboost import CatBoostRegressor
 def detect_gpu_support():
     """Detect if GPU is available for tree-based models"""
     gpu_available = False
+    lgbm_gpu_works = False
     gpu_info = []
     
     # Check CUDA availability
@@ -79,20 +80,30 @@ def detect_gpu_support():
         gpu_available = True
         gpu_info.append(f"CUDA device: {torch.cuda.get_device_name(0)}")
     
-    # Check LightGBM GPU support
+    # Check LightGBM GPU support with actual test
     try:
         import lightgbm as lgb
-        if hasattr(lgb, 'LGBMRegressor'):
-            # Try to create a small GPU model as test
-            try:
-                test_model = lgb.LGBMRegressor(n_estimators=1, device='gpu')
-                gpu_info.append("LightGBM GPU: supported")
-            except:
-                gpu_info.append("LightGBM GPU: not available (CPU build)")
-    except:
-        pass
+        import numpy as np
+        
+        # Create a tiny dataset and try to train on GPU
+        X_test = np.random.rand(100, 10)
+        y_test = np.random.rand(100)
+        
+        test_model = lgb.LGBMRegressor(n_estimators=1, device='gpu', verbose=-1)
+        test_model.fit(X_test, y_test)
+        
+        lgbm_gpu_works = True
+        gpu_info.append("LightGBM GPU: ✓ working")
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'opencl' in error_msg:
+            gpu_info.append("LightGBM GPU: ✗ OpenCL not available")
+        elif 'cuda' in error_msg:
+            gpu_info.append("LightGBM GPU: ✗ CUDA not configured")
+        else:
+            gpu_info.append("LightGBM GPU: ✗ not available")
     
-    return gpu_available, gpu_info
+    return gpu_available and lgbm_gpu_works, gpu_info
 
 def build_argparser():
     ap = argparse.ArgumentParser(description="Smart Product Pricing with Model Save/Load")
@@ -495,12 +506,15 @@ def main():
         gpu_available, gpu_info = detect_gpu_support()
         if gpu_available:
             use_gpu_trees = True
-            print("\n🚀 GPU Detected:")
+            print("\n🚀 GPU Available:")
             for info in gpu_info:
                 print(f"  • {info}")
-            print("  Tree models (LightGBM/CatBoost) will use GPU acceleration")
+            print("  ✓ Tree models (LightGBM/CatBoost) will use GPU acceleration")
         else:
-            print("\n💻 Running on CPU (no GPU detected)")
+            print("\n💻 GPU Status:")
+            for info in gpu_info:
+                print(f"  • {info}")
+            print("  → Training will use CPU (slower but reliable)")
     else:
         print("\n💻 Running on CPU (--cpu_only specified)")
     
@@ -778,14 +792,31 @@ def main():
     lgbm_tfidf = lgb.LGBMRegressor(**lgbm_params)
     
     print(f"  Training with early stopping (max {n_est} trees)...")
-    lgbm_tfidf.fit(
-        X_tfidf[train_idx], target[train_idx],
-        eval_set=[(X_tfidf[val_idx], target[val_idx])],
-        eval_metric='mae',
-        callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False),
-                   lgb.log_evaluation(period=100)]
-    )
-    print(f"  Trained {lgbm_tfidf.best_iteration_} trees (stopped early)")
+    try:
+        lgbm_tfidf.fit(
+            X_tfidf[train_idx], target[train_idx],
+            eval_set=[(X_tfidf[val_idx], target[val_idx])],
+            eval_metric='mae',
+            callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False),
+                       lgb.log_evaluation(period=100)]
+        )
+        print(f"  Trained {lgbm_tfidf.best_iteration_} trees (stopped early)")
+    except Exception as e:
+        if 'gpu' in str(e).lower() or 'opencl' in str(e).lower() or 'cuda' in str(e).lower():
+            print(f"  ⚠ GPU training failed: {str(e)[:100]}")
+            print("  Falling back to CPU...")
+            lgbm_params['device'] = 'cpu'
+            lgbm_tfidf = lgb.LGBMRegressor(**lgbm_params)
+            lgbm_tfidf.fit(
+                X_tfidf[train_idx], target[train_idx],
+                eval_set=[(X_tfidf[val_idx], target[val_idx])],
+                eval_metric='mae',
+                callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False),
+                           lgb.log_evaluation(period=100)]
+            )
+            print(f"  Trained {lgbm_tfidf.best_iteration_} trees on CPU")
+        else:
+            raise
     
     lgbm_tfidf_test = lgbm_tfidf.predict(T_tfidf)
     
@@ -803,8 +834,19 @@ def main():
         cat_params['task_type'] = 'GPU'
     
     cat_model = CatBoostRegressor(**cat_params)
-    cat_model.fit(X_emb, target, eval_set=(X_emb[val_idx], target[val_idx]))
-    print(f"  Trained {cat_model.best_iteration_} iterations (stopped early)")
+    try:
+        cat_model.fit(X_emb, target, eval_set=(X_emb[val_idx], target[val_idx]))
+        print(f"  Trained {cat_model.best_iteration_} iterations (stopped early)")
+    except Exception as e:
+        if 'gpu' in str(e).lower() or 'cuda' in str(e).lower():
+            print(f"  ⚠ GPU training failed: {str(e)[:100]}")
+            print("  Falling back to CPU...")
+            cat_params['task_type'] = 'CPU'
+            cat_model = CatBoostRegressor(**cat_params)
+            cat_model.fit(X_emb, target, eval_set=(X_emb[val_idx], target[val_idx]))
+            print(f"  Trained {cat_model.best_iteration_} iterations on CPU")
+        else:
+            raise
     cat_test = cat_model.predict(T_emb)
     
     print("\n[Base D] Anchor LightGBM...")
@@ -845,14 +887,30 @@ def main():
     lgbm_anchor = lgb.LGBMRegressor(**anchor_params)
     
     print(f"  Training with early stopping (max {anchor_n_est} trees)...")
-    lgbm_anchor.fit(
-        Xtr.iloc[train_idx], target[train_idx],
-        eval_set=[(Xtr.iloc[val_idx], target[val_idx])],
-        eval_metric='rmse',
-        callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False),
-                   lgb.log_evaluation(period=50)]
-    )
-    print(f"  Trained {lgbm_anchor.best_iteration_} trees (stopped early)")
+    try:
+        lgbm_anchor.fit(
+            Xtr.iloc[train_idx], target[train_idx],
+            eval_set=[(Xtr.iloc[val_idx], target[val_idx])],
+            eval_metric='rmse',
+            callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False),
+                       lgb.log_evaluation(period=50)]
+        )
+        print(f"  Trained {lgbm_anchor.best_iteration_} trees (stopped early)")
+    except Exception as e:
+        if 'gpu' in str(e).lower() or 'opencl' in str(e).lower() or 'cuda' in str(e).lower():
+            print(f"  ⚠ GPU training failed, falling back to CPU...")
+            anchor_params['device'] = 'cpu'
+            lgbm_anchor = lgb.LGBMRegressor(**anchor_params)
+            lgbm_anchor.fit(
+                Xtr.iloc[train_idx], target[train_idx],
+                eval_set=[(Xtr.iloc[val_idx], target[val_idx])],
+                eval_metric='rmse',
+                callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False),
+                           lgb.log_evaluation(period=50)]
+            )
+            print(f"  Trained {lgbm_anchor.best_iteration_} trees on CPU")
+        else:
+            raise
     anchor_test = lgbm_anchor.predict(Xte)
     
     print("\n[Base E] KNN blender...")
