@@ -73,7 +73,7 @@ Our multimodal ensemble effectively predicts e-commerce prices by integrating te
 ## Appendix
 
 ### A. Code Artefacts
-- Drive link: [https://github.com/sajal101agrawal/product-pricing-predictor](https://github.com/sajal101agrawal/product-pricing-predictor)
+- Drive link: [https://drive.google.com/drive/folders/1Qsb6n8qJ_5ORaR44cbEZh8jaWtw-tuLB?usp=sharing](https://drive.google.com/drive/folders/1Qsb6n8qJ_5ORaR44cbEZh8jaWtw-tuLB?usp=sharing)
 - Includes: `train_and_save_model.py`, saved models, embedding caches, README with reproduction steps.
 
 ### B. Additional Results
