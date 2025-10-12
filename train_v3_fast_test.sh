@@ -11,7 +11,7 @@ echo "For actual submission, use train_v3_recommended.sh"
 echo ""
 
 python train_and_save_model_v3.py \
-  --max_train 200 \
+  --max_train 5000 \
   --max_test 100 \
   --per_unit \
   --stack_cv \

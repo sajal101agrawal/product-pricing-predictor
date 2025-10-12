@@ -247,7 +247,9 @@ def save_embeddings_cache(cache_dir, name, embeddings, data_hash, metadata=None)
     with open(meta_file, "w") as f:
         json.dump(meta, f, indent=2)
     
-    print(f"  ✓ Cached to {cache_file} ({cache_file.stat().st_size / 1024 / 1024:.1f} MB)")
+    size_mb = cache_file.stat().st_size / 1024 / 1024
+    print(f"  💾 Saved to cache: {name}_embeddings.npz ({size_mb:.1f} MB)")
+    print(f"     → Will be reused on next run (saves 2-10 min depending on data size)")
 
 def load_embeddings_cache(cache_dir, name, data_hash, expected_shape=None, use_cache=True):
     """Load embeddings from cache if valid"""
@@ -332,8 +334,12 @@ def compute_adversarial_weights(X_train, X_test, y_train):
     """
     print("\n[Adversarial Validation] Computing sample weights...")
     
+    # Get number of samples (works for both dense and sparse matrices)
+    n_train = X_train.shape[0]
+    n_test = X_test.shape[0]
+    
     # Create combined dataset
-    y_adv = np.r_[np.zeros(len(X_train)), np.ones(len(X_test))]
+    y_adv = np.r_[np.zeros(n_train), np.ones(n_test)]
     X_all = scipy.sparse.vstack([X_train, X_test])
     
     # Train classifier
@@ -511,6 +517,10 @@ def main():
     use_cache = not args.no_cache
     
     # Cache text embeddings
+    print("\n" + "="*80)
+    print("EMBEDDINGS (with intelligent caching)")
+    print("="*80)
+    print("\nChecking text embeddings cache...")
     train_text_hash = get_data_hash(train, ["catalog_content"])
     test_text_hash = get_data_hash(test, ["catalog_content"])
     
@@ -543,48 +553,82 @@ def main():
             if use_cache:
                 save_embeddings_cache(cache_dir, "test_text", te_txt, test_text_hash, {"model": text_model_name})
     
-    # Images
-    img_tr = infer_image_paths(train, images_dir)
-    img_te = infer_image_paths(test, images_dir)
-    n_found = sum(1 for p in img_tr+img_te if p and os.path.exists(p))
-    found_ratio = n_found / max(1, len(img_tr)+len(img_te))
+    # Images - OPTIMIZATION: Check cache first, download only if needed
+    print("\nChecking image embeddings cache...")
     
-    # Try downloading missing images if some are found but not all
-    if found_ratio >= 0.05 and found_ratio < 0.95 and not args.disable_images:
-        print(f"Found {found_ratio*100:.1f}% of images. Downloading missing images...")
-        try:
-            from utils import download_images
-            images_dir.mkdir(exist_ok=True, parents=True)
-            
-            # Download only missing images
-            if len(train) > 0 and "image_link" in train.columns:
-                missing_train = [link for link, path in zip(train["image_link"].fillna(""), img_tr) 
-                                if link and (not path or not os.path.exists(path))]
-                if missing_train:
-                    print(f"  Downloading {len(missing_train)} missing training images...")
-                    download_images(missing_train, str(images_dir))
-            
-            if len(test) > 0 and "image_link" in test.columns:
-                missing_test = [link for link, path in zip(test["image_link"].fillna(""), img_te)
-                               if link and (not path or not os.path.exists(path))]
-                if missing_test:
-                    print(f"  Downloading {len(missing_test)} missing test images...")
-                    download_images(missing_test, str(images_dir))
-            
-            # Re-check after download
-            img_tr = infer_image_paths(train, images_dir)
-            img_te = infer_image_paths(test, images_dir)
-            n_found = sum(1 for p in img_tr+img_te if p and os.path.exists(p))
-            found_ratio = n_found / max(1, len(img_tr)+len(img_te))
-            print(f"  After download: {found_ratio*100:.1f}% available")
-        except Exception as e:
-            print(f"  Warning: Could not download images: {e}")
+    # Determine image embedding dimensions based on model choice
+    img_dim = 512 if args.use_openclip else 384
+    cache_name = "openclip" if args.use_openclip else "image"
     
-    # Enable images if we have a reasonable amount (>15%) or user forces it
-    enable_images = (not args.disable_images) and (args.use_images or found_ratio >= 0.15)
+    # Check if embeddings are cached
+    train_image_hash = get_data_hash(train, ["sample_id"]) + (f"_{cache_name}" if args.use_openclip else "")
+    test_image_hash = get_data_hash(test, ["sample_id"]) + (f"_{cache_name}" if args.use_openclip else "")
     
-    if enable_images:
+    tr_img_cached = load_embeddings_cache(cache_dir, f"train_{cache_name}", train_image_hash, 
+                                          expected_shape=(len(train), img_dim), use_cache=use_cache)
+    te_img_cached = load_embeddings_cache(cache_dir, f"test_{cache_name}", test_image_hash, 
+                                          expected_shape=(len(test), img_dim), use_cache=use_cache)
+    
+    # OPTIMIZATION: Only process images if embeddings NOT cached
+    if tr_img_cached is not None and te_img_cached is not None:
+        print("  ✅ CACHE HIT: All image embeddings found!")
+        print("  🚀 Fast path: Skipping image download (saves ~5 min) and encoding (saves ~3 min)")
+        print("  📂 Using cached embeddings from previous run")
+        tr_img = tr_img_cached
+        te_img = te_img_cached
+        enable_images = True
+        found_ratio = 1.0  # Not relevant when using cache
+    else:
+        # Cache miss - need to process images
+        if tr_img_cached is None:
+            print("  ⚠ Train image embeddings not in cache")
+        if te_img_cached is None:
+            print("  ⚠ Test image embeddings not in cache")
+        print("  → Will check for images and download if needed")
+        
+        img_tr = infer_image_paths(train, images_dir)
+        img_te = infer_image_paths(test, images_dir)
+        n_found = sum(1 for p in img_tr+img_te if p and os.path.exists(p))
+        found_ratio = n_found / max(1, len(img_tr)+len(img_te))
+        
+        # Try downloading missing images if some are found but not all
+        if found_ratio >= 0.05 and found_ratio < 0.95 and not args.disable_images:
+            print(f"Found {found_ratio*100:.1f}% of images. Downloading missing images...")
+            try:
+                from utils import download_images
+                images_dir.mkdir(exist_ok=True, parents=True)
+                
+                # Download only missing images
+                if len(train) > 0 and "image_link" in train.columns:
+                    missing_train = [link for link, path in zip(train["image_link"].fillna(""), img_tr) 
+                                    if link and (not path or not os.path.exists(path))]
+                    if missing_train:
+                        print(f"  Downloading {len(missing_train)} missing training images...")
+                        download_images(missing_train, str(images_dir))
+                
+                if len(test) > 0 and "image_link" in test.columns:
+                    missing_test = [link for link, path in zip(test["image_link"].fillna(""), img_te)
+                                   if link and (not path or not os.path.exists(path))]
+                    if missing_test:
+                        print(f"  Downloading {len(missing_test)} missing test images...")
+                        download_images(missing_test, str(images_dir))
+                
+                # Re-check after download
+                img_tr = infer_image_paths(train, images_dir)
+                img_te = infer_image_paths(test, images_dir)
+                n_found = sum(1 for p in img_tr+img_te if p and os.path.exists(p))
+                found_ratio = n_found / max(1, len(img_tr)+len(img_te))
+                print(f"  After download: {found_ratio*100:.1f}% available")
+            except Exception as e:
+                print(f"  Warning: Could not download images: {e}")
+        
+        # Enable images if we have a reasonable amount (>15%) or user forces it
+        enable_images = (not args.disable_images) and (args.use_images or found_ratio >= 0.15)
+    
+    if enable_images and (tr_img_cached is None or te_img_cached is None):
+        # Only encode if we don't have cached embeddings
         print(f"Images used (~{found_ratio*100:.1f}% found)")
+        print("Encoding images...")
         
         # V3 IMPROVEMENT: OpenCLIP option
         if args.use_openclip:
@@ -699,8 +743,9 @@ def main():
                     te_img = encode_images_chunked(img_te, chunk_size=1280, batch_size=128).astype(np.float32)
                     if use_cache:
                         save_embeddings_cache(cache_dir, "test_image", te_img, test_image_hash)
-    else:
-        print(f"Skip images (~{found_ratio*100:.1f}% found)")
+    elif not enable_images:
+        # Images disabled or not enough available - use zero embeddings
+        print(f"Skip images (~{found_ratio*100:.1f}% found)" if 'found_ratio' in locals() else "Skip images (disabled)")
         # Determine image embedding size based on model
         img_dim = 512 if args.use_openclip else 384
         tr_img = np.zeros((len(train), img_dim), dtype=np.float32)

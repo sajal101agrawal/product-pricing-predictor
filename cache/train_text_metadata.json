@@ -1,0 +1,9 @@
+{
+  "data_hash": "e3897910132956b8",
+  "shape": [
+    5000,
+    384
+  ],
+  "dtype": "float32",
+  "model": "BAAI/bge-small-en-v1.5"
+}
